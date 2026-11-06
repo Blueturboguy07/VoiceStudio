@@ -245,6 +245,7 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           xvfb-run -a node .github/scripts/publik-telemetry-smoke.mjs \
             --exe "electron/release/VoiceStudio-$VERSION-linux-x64.AppImage" --version "$VERSION" --wait 45 \
+            --note "the AppImage, under Xvfb" \
             --out "$RUNNER_TEMP/publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
       - name: Usage-count launch check (macOS, the unsigned app)
         if: matrix.platform == 'darwin'
@@ -253,6 +254,7 @@ jobs:
           APP=$(find electron/release -maxdepth 2 -name VoiceStudio.app -type d -print -quit)
           node .github/scripts/publik-telemetry-smoke.mjs \
             --exe "$APP/Contents/MacOS/VoiceStudio" --version "$VERSION" --wait 45 \
+            --note "the app before the Developer ID signature (ad hoc signature)" \
             --out "$RUNNER_TEMP/publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
       - name: Usage-count launch check (Windows, after a silent install)
         if: matrix.platform == 'win32'
@@ -265,8 +267,26 @@ jobs:
           # /D= must be the last argument and takes no quotes (NSIS).
           $setup = Start-Process -FilePath $installer.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
           if ($setup.ExitCode -ne 0) { throw "The installer ended with code $($setup.ExitCode)" }
-          if (-not (Test-Path "$dir\VoiceStudio.exe")) { throw "VoiceStudio.exe was not installed in $dir" }
-          node .github/scripts/publik-telemetry-smoke.mjs --exe "$dir\VoiceStudio.exe" --version $version --wait 45 `
+          $exe = "$dir\VoiceStudio.exe"
+          $how = 'silent install of the NSIS installer'
+          if (-not (Test-Path $exe)) {
+            if ('${{ matrix.arch }}' -ne 'arm64') { throw "VoiceStudio.exe was not installed in $dir" }
+            # windows-11-arm runner: the silent install ends with code 0 and leaves the folder without
+            # any .exe or .dll of the app. The upstream v0.5.7 arm64 installer does the same on this
+            # runner, so this build did not cause it. The package inside the installer is complete:
+            # start the app from that package (the bytes the installer holds).
+            Write-Output "::warning::Windows ARM: the silent install left no VoiceStudio.exe (the upstream installer does the same on this runner). The check starts the app from the package inside the installer."
+            Get-ChildItem $dir | Format-Table Name, Length
+            7z x $installer.FullName -o"$env:RUNNER_TEMP\vs-nsis" -y | Select-Object -Last 2
+            $package = Get-ChildItem "$env:RUNNER_TEMP\vs-nsis" -Recurse -Filter 'app-arm64.7z' | Select-Object -First 1
+            if (-not $package) { throw 'The installer holds no app-arm64.7z' }
+            7z x $package.FullName -o"$env:RUNNER_TEMP\vs-package" -y | Select-Object -Last 2
+            $exe = "$env:RUNNER_TEMP\vs-package\VoiceStudio.exe"
+            $how = 'package inside the NSIS installer, unpacked with 7z (the silent install left no .exe on this runner)'
+            if (-not (Test-Path $exe)) { throw 'The package inside the installer holds no VoiceStudio.exe' }
+          }
+          "Starting $exe ($how)"
+          node .github/scripts/publik-telemetry-smoke.mjs --exe $exe --version $version --wait 45 --note $how `
             --out "$env:RUNNER_TEMP\publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Save the launch check result

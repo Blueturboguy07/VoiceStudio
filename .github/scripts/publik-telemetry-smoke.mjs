@@ -6,7 +6,8 @@
 // The app gets a temporary home and profile, and its backend is not started.
 // Nothing leaves the computer: the endpoint is the local listener.
 //
-// usage: node publik-telemetry-smoke.mjs --exe <path> --version <x.y.z> [--out <file>] [--wait <s>] [-- <app args>]
+// usage: node publik-telemetry-smoke.mjs --exe <path> --version <x.y.z> [--out <file>] [--wait <s>]
+//        [--note <how the app got on disk>] [-- <app args>]
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -25,6 +26,7 @@ const exe = resolve(option('exe', ''));
 const wantVersion = option('version', '');
 const out = option('out', '');
 const waitSeconds = Number(option('wait', '30'));
+const note = option('note', '');
 const SLUG = 'voicestudio';
 if (!option('exe', '') || !wantVersion) throw new Error('usage: --exe <path> --version <x.y.z>');
 if (!existsSync(exe)) throw new Error(`no such executable: ${exe}`);
@@ -146,7 +148,8 @@ async function launch(extraEnv, seconds, stopOnFirstRequest) {
     exitedEarly,
     spawnError,
     installIdFile,
-    logTail: log.split(/\r?\n/).filter((line) => /publik-telemetry|supervisor|rror/.test(line)).slice(-12),
+    debugLines: log.split(/\r?\n/).filter((line) => line.includes('publik-telemetry:')),
+    logTail: log.split(/\r?\n/).filter((line) => /supervisor|rror/.test(line)).slice(-8),
   };
 }
 
@@ -202,6 +205,7 @@ check(!off.installIdFile, 'DO_NOT_TRACK=1 still created telemetry.json');
 server.close();
 const report = {
   exe,
+  note,
   platform: process.platform,
   arch: process.arch,
   expected: { app: SLUG, app_version: wantVersion },
