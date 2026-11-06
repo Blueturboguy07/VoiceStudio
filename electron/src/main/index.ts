@@ -5,6 +5,7 @@ import { installNativeCapture } from './native-capture';
 import { isTrustedRenderer } from './trusted-renderer';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron';
 import { electronApp, is, optimizer } from '@electron-toolkit/utils';
@@ -37,6 +38,23 @@ process.stderr?.on('error', () => {});
 const here = dirname(fileURLToPath(import.meta.url));
 const PRELOAD_PATH = join(here, '../preload/index.mjs');
 const RENDERER_DIR = join(here, '../renderer');
+
+/**
+ * publik usage counts (README, "Usage counts"): one `app_opened` per launch and
+ * one `active_session` every 30 minutes, sent from this process in the
+ * background. The client is a plain CommonJS file that electron-builder ships
+ * next to the bundle (`files` in electron-builder.config.mjs). It never throws.
+ */
+function startPublikTelemetry(): void {
+  try {
+    const client = createRequire(import.meta.url)(
+      join(here, '..', '..', 'src', 'main', 'publik-telemetry.cjs'),
+    ) as { start(appSlug: string, appVersion: string): void };
+    client.start('voicestudio', __APP_VERSION__);
+  } catch {
+    /* usage counts must never block start-up */
+  }
+}
 
 // Neutral startup surface; transparent caption controls follow the CSS title bar.
 const BACKGROUND = '#0a0a0a';
@@ -248,6 +266,7 @@ if (process.env.VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES !== '1' && !app.requestSing
     .whenReady()
     .then(async () => {
       electronApp.setAppUserModelId(APP_ID);
+      startPublikTelemetry();
       if (process.platform === 'darwin') installMacApplicationMenu(app, Menu, __APP_VERSION__);
       installRendererPermissions(session.defaultSession, process.env.ELECTRON_RENDERER_URL);
       app.on('browser-window-created', (_event, window) => optimizer.watchWindowShortcuts(window));

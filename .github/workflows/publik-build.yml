@@ -1,0 +1,279 @@
+name: publik build
+
+# Builds the publik fork (see PUBLIK-BUILD.md) for every desktop platform of the
+# upstream release, with the same commands as electron-release.yml.
+# It uploads workflow artifacts only. It never creates, changes or publishes a
+# release, and it has no signing secrets: the macOS app is signed, notarized
+# and packaged outside CI, from the `.app` this workflow uploads.
+on:
+  push:
+    branches: ['telemetry/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publik-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: typecheck and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: '1.4.2'
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run --cwd electron typecheck
+      - name: Unit tests
+        run: bun run --cwd electron test
+
+  package:
+    name: package ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+            target: x86_64-unknown-linux-gnu
+            flags: --linux --x64
+          - runner: windows-2022
+            platform: win32
+            arch: x64
+            target: x86_64-pc-windows-msvc
+            flags: --win --x64
+          - runner: windows-11-arm
+            platform: win32
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+            flags: --win --arm64
+          # macOS: only the zip target. It makes electron-builder write the same
+          # app-update.yml into the app as a release build; the dmg and the final
+          # zip are made after signing, outside CI.
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            flags: --mac zip --arm64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+            target: x86_64-apple-darwin
+            flags: --mac zip --x64
+    defaults:
+      run:
+        shell: bash
+    env:
+      VOICESTUDIO_RUST_TARGET: ${{ matrix.target }}
+      VOICESTUDIO_UPDATE_CHANNEL: electron-stable-${{ matrix.platform }}-${{ matrix.arch }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: '1.4.2'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: native/desktop-bridge -> target
+          key: electron-${{ matrix.target }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.12.13'
+          enable-cache: false
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libxdo-dev libxtst-dev libx11-dev libxkbcommon-dev libwayland-dev libssl-dev pkg-config xvfb zsync
+      - name: Bundle pinned uv for the host architecture
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { mkdirSync, copyFileSync, chmodSync } from 'node:fs';
+          import { join } from 'node:path';
+          const expected = process.env.VOICESTUDIO_RUST_TARGET;
+          const targets = { 'linux-x64': 'x86_64-unknown-linux-gnu', 'win32-x64': 'x86_64-pc-windows-msvc', 'win32-arm64': 'aarch64-pc-windows-msvc', 'darwin-arm64': 'aarch64-apple-darwin', 'darwin-x64': 'x86_64-apple-darwin' };
+          if (targets[`${process.platform}-${process.arch}`] !== expected) throw new Error('Runner architecture does not match package target');
+          const source = execFileSync(process.platform === 'win32' ? 'where.exe' : 'which', ['uv'], { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+          const dir = 'electron/build/uv';
+          mkdirSync(dir, { recursive: true });
+          const destination = join(dir, `uv-${expected}${process.platform === 'win32' ? '.exe' : ''}`);
+          copyFileSync(source, destination);
+          if (process.platform !== 'win32') chmodSync(destination, 0o755);
+          NODE
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      # check:electron without its typecheck and unit tests (the `checks` job runs those once).
+      - name: Validate and build Electron
+        run: |
+          node scripts/validate_store_foundation.mjs
+          bun run --cwd electron build
+          bun run --cwd electron build:web
+          node electron/tests/packaging-contract.mjs
+      - name: Package without publishing
+        working-directory: electron
+        run: |
+          bun x electron-builder --config electron-builder.config.mjs ${{ matrix.flags }} --publish never
+          if [ "$RUNNER_OS" = Linux ]; then
+            node scripts/embed-appimage-update.mjs
+          fi
+          node tests/packaging-contract.mjs --artifact
+          node tests/update-package-contract.mjs --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+          if [ "$RUNNER_OS" = Linux ]; then
+            # The .zsync that embed-appimage-update.mjs wrote names the upstream copy of the
+            # AppImage as its download URL, and that copy has other bytes. Write it again for
+            # the same AppImage with the URL of this fork's release, so the file is correct.
+            VERSION=$(node -p "require('../package.json').version")
+            IMAGE="VoiceStudio-$VERSION-linux-x64.AppImage"
+            (cd release && zsyncmake -u "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION-publik.1/$IMAGE" -o "$IMAGE.zsync" "$IMAGE")
+            head -c 4096 "release/$IMAGE.zsync" | grep -a -E '^(Filename|URL|Length|SHA-1):'
+          fi
+          node ../scripts/create_store_artifact_manifest.mjs --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+      - name: The packaged app holds the usage-count client
+        run: |
+          ASAR=$(find electron/release -maxdepth 5 -name app.asar -print -quit)
+          test -n "$ASAR"
+          RESOURCES=$(dirname "$ASAR")
+          node - "$RESOURCES/app.asar" <<'NODE'
+          const { readFileSync } = require('node:fs');
+          const asar = readFileSync(process.argv[2]);
+          for (const needle of ['publik-telemetry.cjs', 'https://publikhq.com/api/v1/telemetry']) {
+            if (!asar.includes(needle)) throw new Error(`app.asar has no ${needle}`);
+          }
+          console.log('app.asar holds publik-telemetry.cjs');
+          NODE
+          if [ "$RUNNER_OS" != Linux ]; then
+            echo "app-update.yml:"; cat "$RESOURCES/app-update.yml"
+          fi
+      - name: Describe the release files
+        working-directory: electron/release
+        run: |
+          OUT="release-files-${{ matrix.platform }}-${{ matrix.arch }}.txt"
+          for f in VoiceStudio-* electron-*.yml store-artifact-manifest-*.json; do
+            [ -f "$f" ] || continue
+            SUM=$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d' ' -f1)
+            SIZE=$(wc -c < "$f" | tr -d ' ')
+            printf '%s  %s  %s bytes  %s\n' "$SUM" "$f" "$SIZE" "$(file -b "$f" | cut -c1-120)" | tee -a "$OUT"
+          done
+      - name: Pack the unsigned macOS app
+        if: matrix.platform == 'darwin'
+        run: |
+          APP=$(find electron/release -maxdepth 2 -name VoiceStudio.app -type d -print -quit)
+          test -n "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E 'Identifier|Signature|TeamIdentifier' || true
+          mkdir -p "$RUNNER_TEMP/mac-app"
+          # ditto keeps the symlinks of the frameworks; a plain zip does not.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/mac-app/VoiceStudio-mac-${{ matrix.arch }}-unsigned-app.zip"
+          cp electron/release/electron-*.yml electron/release/release-files-*.txt "$RUNNER_TEMP/mac-app/"
+          ls -l "$RUNNER_TEMP/mac-app"
+      - name: Save the unsigned macOS app
+        if: matrix.platform == 'darwin'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publik-darwin-${{ matrix.arch }}-app
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+          path: ${{ runner.temp }}/mac-app/*
+      - name: Save the Windows installer and updater metadata
+        if: matrix.platform == 'win32'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publik-win32-${{ matrix.arch }}
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            electron/release/VoiceStudio-*
+            electron/release/electron-*.yml
+            electron/release/store-artifact-manifest-*.json
+            electron/release/release-files-*.txt
+      - name: Save the AppImage
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publik-linux-${{ matrix.arch }}-appimage
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            electron/release/VoiceStudio-*.AppImage
+            electron/release/VoiceStudio-*.AppImage.zsync
+      - name: Save the deb package
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publik-linux-${{ matrix.arch }}-deb
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+          path: electron/release/VoiceStudio-*.deb
+      - name: Save the Linux updater metadata
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publik-linux-${{ matrix.arch }}-meta
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            electron/release/electron-*.yml
+            electron/release/store-artifact-manifest-*.json
+            electron/release/release-files-*.txt
+      # Launch check: one app_opened must reach a listener on 127.0.0.1, and none with DO_NOT_TRACK=1.
+      - name: Usage-count launch check (Linux, the AppImage)
+        if: matrix.platform == 'linux'
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          xvfb-run -a node .github/scripts/publik-telemetry-smoke.mjs \
+            --exe "electron/release/VoiceStudio-$VERSION-linux-x64.AppImage" --version "$VERSION" --wait 45 \
+            --out "$RUNNER_TEMP/publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+      - name: Usage-count launch check (macOS, the unsigned app)
+        if: matrix.platform == 'darwin'
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          APP=$(find electron/release -maxdepth 2 -name VoiceStudio.app -type d -print -quit)
+          node .github/scripts/publik-telemetry-smoke.mjs \
+            --exe "$APP/Contents/MacOS/VoiceStudio" --version "$VERSION" --wait 45 \
+            --out "$RUNNER_TEMP/publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+      - name: Usage-count launch check (Windows, after a silent install)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $version = node -p "require('./package.json').version"
+          $installer = Get-ChildItem "electron/release/VoiceStudio-$version-win-${{ matrix.arch }}.exe"
+          $dir = Join-Path $env:RUNNER_TEMP 'vs-install'
+          # /D= must be the last argument and takes no quotes (NSIS).
+          $setup = Start-Process -FilePath $installer.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "The installer ended with code $($setup.ExitCode)" }
+          if (-not (Test-Path "$dir\VoiceStudio.exe")) { throw "VoiceStudio.exe was not installed in $dir" }
+          node .github/scripts/publik-telemetry-smoke.mjs --exe "$dir\VoiceStudio.exe" --version $version --wait 45 `
+            --out "$env:RUNNER_TEMP\publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Save the launch check result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/publik-telemetry-smoke-*.json

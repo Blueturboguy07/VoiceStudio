@@ -70,8 +70,7 @@ on:
       - "CHANGELOG.md"
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/*.md"
-  release:
-    types: [published]
+  # publik fork: the `release: published` trigger is removed (see PUBLIK-BUILD.md).
   workflow_dispatch:
     inputs:
       backfill_release:

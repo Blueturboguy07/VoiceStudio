@@ -4,9 +4,8 @@ name: Snap Store package
 # is never automatic: an owner dispatches `promote_revision` after the
 # runbook's install, refresh and rollback checks. Store credentials exist only
 # in the `snap-store` environment used by the upload and promote jobs.
+# publik fork: the `push: tags: ['v*']` trigger is removed (see PUBLIK-BUILD.md).
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       upload:

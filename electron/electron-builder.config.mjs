@@ -146,7 +146,8 @@ export default {
   // The default FUSE2 runtime cannot start on distros without libfuse.so.2.
   // v26's pinned static runtime keeps AppImage mounting independent of FUSE2.
   toolsets: { appimage: '1.0.3' },
-  files: ['out/**/*', 'package.json'],
+  // publik-telemetry.cjs is loaded at run time by src/main/index.ts (usage counts).
+  files: ['out/**/*', 'package.json', 'src/main/publik-telemetry.cjs'],
   // The Python backend + engine sources ride along as plain resources (same as
   // the installer): the shell bootstraps a uv venv on first run.
   extraResources: [

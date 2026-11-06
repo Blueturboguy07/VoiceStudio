@@ -4,9 +4,11 @@ name: Electron desktop release
 # Two channels, both cut from main: `vX.Y.Z` is Stable (GitHub's `latest`),
 # `vX.Y.Z-beta.N` is Beta (a prerelease that never becomes `latest`). No other
 # prerelease shape (-rc, -alpha, ...) is accepted.
+# publik fork: the `push: tags: ['v*']` trigger is removed. A publik release is a
+# draft whose files were built by publik-build.yml and checked by hand; the tag
+# appears only when that draft is published, and nothing may build or upload
+# over those files then. See PUBLIK-BUILD.md.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       release_tag:
