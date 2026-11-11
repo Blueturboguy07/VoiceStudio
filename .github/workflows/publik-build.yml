@@ -5,6 +5,11 @@ name: publik build
 # It uploads workflow artifacts only. It never creates, changes or publishes a
 # release, and it has no signing secrets: the macOS app is signed, notarized
 # and packaged outside CI, from the `.app` this workflow uploads.
+# Its one secret is PUBLIK_APP_TOKEN (the pat_ app token of the publik listing):
+# the package job writes it to electron/publik-app-token.txt (in .gitignore), and
+# electron-builder packs that file into app.asar for the Sign in with publik gate.
+# Every packaged app then runs two checks against a fake publik on the runner:
+# the built app's self-test (PUBLIK_SELF_TEST=1) and the gate launch check.
 on:
   push:
     branches: ['telemetry/**']
@@ -77,6 +82,8 @@ jobs:
       run:
         shell: bash
     env:
+      # The n of the release tag v<version>-publik.<n> these files are for (the AppImage .zsync URL).
+      PUBLIK_BUILD: '2'
       VOICESTUDIO_RUST_TARGET: ${{ matrix.target }}
       VOICESTUDIO_UPDATE_CHANNEL: electron-stable-${{ matrix.platform }}-${{ matrix.arch }}
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
@@ -129,6 +136,17 @@ jobs:
           bun run --cwd electron build
           bun run --cwd electron build:web
           node electron/tests/packaging-contract.mjs
+      - name: Bake the publik app token
+        env:
+          PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
+        run: |
+          case "$PUBLIK_APP_TOKEN" in
+            pat_*) ;;
+            *) echo "::error::The repository secret PUBLIK_APP_TOKEN is missing or is not a pat_ token."; exit 1 ;;
+          esac
+          printf '%s' "$PUBLIK_APP_TOKEN" > electron/publik-app-token.txt
+          echo "electron/publik-app-token.txt: $(wc -c < electron/publik-app-token.txt | tr -d ' ') bytes"
+          git check-ignore -q electron/publik-app-token.txt
       - name: Package without publishing
         working-directory: electron
         run: |
@@ -144,11 +162,11 @@ jobs:
             # the same AppImage with the URL of this fork's release, so the file is correct.
             VERSION=$(node -p "require('../package.json').version")
             IMAGE="VoiceStudio-$VERSION-linux-x64.AppImage"
-            (cd release && zsyncmake -u "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION-publik.1/$IMAGE" -o "$IMAGE.zsync" "$IMAGE")
+            (cd release && zsyncmake -u "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION-publik.$PUBLIK_BUILD/$IMAGE" -o "$IMAGE.zsync" "$IMAGE")
             head -c 4096 "release/$IMAGE.zsync" | grep -a -E '^(Filename|URL|Length|SHA-1):'
           fi
           node ../scripts/create_store_artifact_manifest.mjs --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
-      - name: The packaged app holds the usage-count client
+      - name: The packaged app holds the publik module, the gate preload and the app token
         run: |
           ASAR=$(find electron/release -maxdepth 5 -name app.asar -print -quit)
           test -n "$ASAR"
@@ -156,10 +174,22 @@ jobs:
           node - "$RESOURCES/app.asar" <<'NODE'
           const { readFileSync } = require('node:fs');
           const asar = readFileSync(process.argv[2]);
-          for (const needle of ['publik-telemetry.cjs', 'https://publikhq.com/api/v1/telemetry']) {
+          // The strings publik's scan reads and the gate's words, in the bundled main process.
+          for (const needle of ['/api/v1/installs', '/api/v1/telemetry', '/api/v1/wallet', 'app_opened', 'APP_SLUG = "voicestudio"',
+            'Sign in with publik', 'publik-gate-preload.cjs', 'publik-gate:press']) {
             if (!asar.includes(needle)) throw new Error(`app.asar has no ${needle}`);
           }
-          console.log('app.asar holds publik-telemetry.cjs');
+          if (asar.includes('publik-telemetry.cjs')) throw new Error('app.asar still holds the old telemetry v1 client');
+          // The asar header (a JSON index after two 32-bit sizes) lists the files; data starts after it.
+          const header = JSON.parse(asar.subarray(16, 16 + asar.readUInt32LE(12)).toString('utf8'));
+          const base = 8 + asar.readUInt32LE(4);
+          if (!header.files.src?.files?.main?.files?.['publik-gate-preload.cjs']) throw new Error('app.asar has no src/main/publik-gate-preload.cjs');
+          const token = header.files['publik-app-token.txt'];
+          if (!token) throw new Error('app.asar has no publik-app-token.txt');
+          const start = base + Number(token.offset);
+          // Checked, never printed.
+          if (!asar.subarray(start, start + token.size).toString('utf8').trim().startsWith('pat_')) throw new Error('publik-app-token.txt in app.asar is not a pat_ token');
+          console.log(`app.asar holds the publik module, the gate preload and the app token (${token.size} bytes)`);
           NODE
           if [ "$RUNNER_OS" != Linux ]; then
             echo "app-update.yml:"; cat "$RESOURCES/app-update.yml"
@@ -238,28 +268,38 @@ jobs:
             electron/release/electron-*.yml
             electron/release/store-artifact-manifest-*.json
             electron/release/release-files-*.txt
-      # Launch check: one app_opened must reach a listener on 127.0.0.1, and none with DO_NOT_TRACK=1.
-      - name: Usage-count launch check (Linux, the AppImage)
+      # Launch checks against a fake publik on 127.0.0.1 (PUBLIK_ORIGIN): nothing reaches publikhq.com.
+      #   publik-self-test.cjs: PUBLIK_SELF_TEST=1 must print "publik self-test: ok voicestudio <version>".
+      #   publik-gate-smoke.mjs: signed in, one app_opened with the install key, then VoiceStudio starts;
+      #   DO_NOT_TRACK=1 sends nothing; not signed in, the gate holds the app.
+      - name: publik launch checks (Linux, the AppImage)
         if: matrix.platform == 'linux'
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          xvfb-run -a node .github/scripts/publik-telemetry-smoke.mjs \
-            --exe "electron/release/VoiceStudio-$VERSION-linux-x64.AppImage" --version "$VERSION" --wait 45 \
+          IMAGE="electron/release/VoiceStudio-$VERSION-linux-x64.AppImage"
+          xvfb-run -a node .github/scripts/publik-self-test.cjs voicestudio "$IMAGE" \
+            --out "$RUNNER_TEMP/publik-self-test-${{ matrix.platform }}-${{ matrix.arch }}.json" -- --no-sandbox
+          xvfb-run -a node .github/scripts/publik-gate-smoke.mjs \
+            --exe "$IMAGE" --version "$VERSION" --wait 60 \
             --note "the AppImage, under Xvfb" \
-            --out "$RUNNER_TEMP/publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
-      - name: Usage-count launch check (macOS, the unsigned app)
+            --out "$RUNNER_TEMP/publik-gate-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+      - name: publik launch checks (macOS, the unsigned app)
         if: matrix.platform == 'darwin'
         run: |
           VERSION=$(node -p "require('./package.json').version")
           APP=$(find electron/release -maxdepth 2 -name VoiceStudio.app -type d -print -quit)
-          node .github/scripts/publik-telemetry-smoke.mjs \
-            --exe "$APP/Contents/MacOS/VoiceStudio" --version "$VERSION" --wait 45 \
+          node .github/scripts/publik-self-test.cjs voicestudio "$APP/Contents/MacOS/VoiceStudio" \
+            --out "$RUNNER_TEMP/publik-self-test-${{ matrix.platform }}-${{ matrix.arch }}.json" -- --use-mock-keychain
+          node .github/scripts/publik-gate-smoke.mjs \
+            --exe "$APP/Contents/MacOS/VoiceStudio" --version "$VERSION" --wait 60 \
             --note "the app before the Developer ID signature (ad hoc signature)" \
-            --out "$RUNNER_TEMP/publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
-      - name: Usage-count launch check (Windows, after a silent install)
+            --out "$RUNNER_TEMP/publik-gate-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+      - name: publik launch checks (Windows, after a silent install)
         if: matrix.platform == 'win32'
         shell: pwsh
-        timeout-minutes: 15
+        timeout-minutes: 20
+        env:
+          VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES: '1'
         run: |
           $version = node -p "require('./package.json').version"
           $installer = Get-ChildItem "electron/release/VoiceStudio-$version-win-${{ matrix.arch }}.exe"
@@ -275,7 +315,7 @@ jobs:
             # any .exe or .dll of the app. The upstream v0.5.7 arm64 installer does the same on this
             # runner, so this build did not cause it. The package inside the installer is complete:
             # start the app from that package (the bytes the installer holds).
-            Write-Output "::warning::Windows ARM: the silent install left no VoiceStudio.exe (the upstream installer does the same on this runner). The check starts the app from the package inside the installer."
+            Write-Output "::warning::Windows ARM: the silent install left no VoiceStudio.exe (the upstream installer does the same on this runner). The checks start the app from the package inside the installer."
             Get-ChildItem $dir | Format-Table Name, Length
             7z x $installer.FullName -o"$env:RUNNER_TEMP\vs-nsis" -y | Select-Object -Last 2
             $package = Get-ChildItem "$env:RUNNER_TEMP\vs-nsis" -Recurse -Filter 'app-arm64.7z' | Select-Object -First 1
@@ -286,14 +326,19 @@ jobs:
             if (-not (Test-Path $exe)) { throw 'The package inside the installer holds no VoiceStudio.exe' }
           }
           "Starting $exe ($how)"
-          node .github/scripts/publik-telemetry-smoke.mjs --exe $exe --version $version --wait 45 --note $how `
-            --out "$env:RUNNER_TEMP\publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+          node .github/scripts/publik-self-test.cjs voicestudio $exe `
+            --out "$env:RUNNER_TEMP\publik-self-test-${{ matrix.platform }}-${{ matrix.arch }}.json"
           if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: Save the launch check result
+          node .github/scripts/publik-gate-smoke.mjs --exe $exe --version $version --wait 60 --note $how `
+            --out "$env:RUNNER_TEMP\publik-gate-smoke-${{ matrix.platform }}-${{ matrix.arch }}.json"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Save the launch check results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: publik-telemetry-smoke-${{ matrix.platform }}-${{ matrix.arch }}
+          name: publik-launch-checks-${{ matrix.platform }}-${{ matrix.arch }}
           retention-days: 14
           if-no-files-found: warn
-          path: ${{ runner.temp }}/publik-telemetry-smoke-*.json
+          path: |
+            ${{ runner.temp }}/publik-self-test-*.json
+            ${{ runner.temp }}/publik-gate-smoke-*.json

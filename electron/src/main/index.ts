@@ -5,7 +5,6 @@ import { installNativeCapture } from './native-capture';
 import { isTrustedRenderer } from './trusted-renderer';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron';
 import { electronApp, is, optimizer } from '@electron-toolkit/utils';
@@ -27,6 +26,8 @@ import { activateLiveWindow, isLiveWindow } from './window-safety';
 import { startAccount } from './account';
 import { installAppIdentity, installMacApplicationMenu } from './app-identity';
 import { APP_ID, PRODUCT_NAME } from '../../../config/app-config.mjs';
+import { ensureSignedIn } from './publik';
+import { electronGateUI } from './publik-gate';
 
 // Packaged GUI launches can inherit a short-lived terminal pipe. When that
 // launcher exits, diagnostic console writes emit EPIPE asynchronously and can
@@ -38,23 +39,6 @@ process.stderr?.on('error', () => {});
 const here = dirname(fileURLToPath(import.meta.url));
 const PRELOAD_PATH = join(here, '../preload/index.mjs');
 const RENDERER_DIR = join(here, '../renderer');
-
-/**
- * publik usage counts (README, "Usage counts"): one `app_opened` per launch and
- * one `active_session` every 30 minutes, sent from this process in the
- * background. The client is a plain CommonJS file that electron-builder ships
- * next to the bundle (`files` in electron-builder.config.mjs). It never throws.
- */
-function startPublikTelemetry(): void {
-  try {
-    const client = createRequire(import.meta.url)(
-      join(here, '..', '..', 'src', 'main', 'publik-telemetry.cjs'),
-    ) as { start(appSlug: string, appVersion: string): void };
-    client.start('voicestudio', __APP_VERSION__);
-  } catch {
-    /* usage counts must never block start-up */
-  }
-}
 
 // Neutral startup surface; transparent caption controls follow the CSS title bar.
 const BACKGROUND = '#0a0a0a';
@@ -80,6 +64,10 @@ let closeUpdates: (() => void) | null = null;
 let closeRepairAgents: (() => void) | null = null;
 let closeAccount: (() => void) | null = null;
 let quitPreparation: Promise<void> | null = null;
+// publik build (PUBLIK-BUILD.md): true once VoiceStudio's own window exists. Before that the only
+// window is the Sign in with publik gate: closing it quits the app (publik-gate.ts), and its
+// planned close after the sign-in must not count as "all windows closed".
+let appWindowCreated = false;
 
 const PERSISTENCE_FLUSH_REQUEST = 'app:flush-persistence';
 const PERSISTENCE_FLUSHED = 'app:persistence-flushed';
@@ -153,6 +141,7 @@ ipcMain.handle(
 );
 
 function createWindow(): BrowserWindow {
+  appWindowCreated = true;
   const appUrl =
     is.dev && process.env.ELECTRON_RENDERER_URL
       ? process.env.ELECTRON_RENDERER_URL
@@ -266,8 +255,15 @@ if (process.env.VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES !== '1' && !app.requestSing
     .whenReady()
     .then(async () => {
       electronApp.setAppUserModelId(APP_ID);
-      startPublikTelemetry();
       if (process.platform === 'darwin') installMacApplicationMenu(app, Menu, __APP_VERSION__);
+      // publik build (PUBLIK-BUILD.md): VoiceStudio opens with Sign in with publik. The gate
+      // window shows until this computer is signed in, then starts the usage counts (app_opened
+      // now, active_session every 30 minutes). Everything below waits for it: the renderer
+      // permissions, the backend and its runtime install, the account, the updater and the
+      // app's own window. PUBLIK_SELF_TEST=1 prints the self-test line and exits here instead.
+      const publikGate = electronGateUI({ appName: PRODUCT_NAME });
+      await ensureSignedIn(publikGate);
+      publikGate.close();
       installRendererPermissions(session.defaultSession, process.env.ELECTRON_RENDERER_URL);
       app.on('browser-window-created', (_event, window) => optimizer.watchWindowShortcuts(window));
 
@@ -375,7 +371,7 @@ if (process.env.VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES !== '1' && !app.requestSing
     });
 
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit();
+    if (appWindowCreated && process.platform !== 'darwin') app.quit();
   });
 
   // The first pass gives renderer persistence a bounded chance to settle, then

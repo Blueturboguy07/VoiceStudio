@@ -146,8 +146,10 @@ export default {
   // The default FUSE2 runtime cannot start on distros without libfuse.so.2.
   // v26's pinned static runtime keeps AppImage mounting independent of FUSE2.
   toolsets: { appimage: '1.0.3' },
-  // publik-telemetry.cjs is loaded at run time by src/main/index.ts (usage counts).
-  files: ['out/**/*', 'package.json', 'src/main/publik-telemetry.cjs'],
+  // publik build (PUBLIK-BUILD.md): the preload of the Sign in with publik window (publik-gate.ts)
+  // and the app token, which .github/workflows/publik-build.yml writes from the PUBLIK_APP_TOKEN
+  // secret (the file is in .gitignore; the publik module reads it at the root of app.asar).
+  files: ['out/**/*', 'package.json', 'src/main/publik-gate-preload.cjs', 'publik-app-token.txt'],
   // The Python backend + engine sources ride along as plain resources (same as
   // the installer): the shell bootstraps a uv venv on first run.
   extraResources: [

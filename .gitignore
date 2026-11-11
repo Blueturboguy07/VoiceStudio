@@ -32,6 +32,8 @@ native/**/target*/
 .env
 .env.local
 .env.*.local
+# publik build: the app token, written at build time from the PUBLIK_APP_TOKEN secret
+publik-app-token.txt
 
 # ─────────────────────────────────────────────────────────────────────────
 #  OS junk

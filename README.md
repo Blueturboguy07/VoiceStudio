@@ -35,11 +35,12 @@ Start with **VoiceStudio** (default, powered by k2-fsa/OmniVoice), or choose ano
 
 Local workflows run on your hardware. Remote services are optional; usage analytics requires consent.
 
-### Usage counts (publik build)
+### Sign in with publik and usage counts (publik build)
 
-This is the publik build of VoiceStudio ([what it changes](PUBLIK-BUILD.md)). The desktop app sends two anonymous usage counts to publik: `app_opened` one time for each launch, and `active_session` every 30 minutes while the app runs.
-Each count holds the app name, the app version, the operating system, the CPU type and a random install ID. It holds no audio, no text, no file names and no account data.
-These counts are on by default; the consent rule above is for VoiceStudio's own analytics. To turn the counts off, set `DO_NOT_TRACK=1` (or `PUBLIK_TELEMETRY=0`) in the environment.
+This is the publik build of VoiceStudio ([what it changes](PUBLIK-BUILD.md)). The desktop app opens with **Sign in with publik**, before every other screen. Click the button and sign in in your browser; the app continues when you are signed in. The sign-in needs a publik account and a connection to publikhq.com. It sends the app name and version, the operating system, the CPU type and the computer name. VoiceStudio uses no publik AI service: after the sign-in, your models, voices, audio and text stay on this computer, as before.
+After the sign-in, the desktop app sends two usage counts to publik: `app_opened` one time for each launch, and `active_session` every 30 minutes while the app runs.
+Each count holds the app name, the app version, the operating system, the CPU type, a random install ID and this computer's publik key, so publik counts a signed-in person one time. It holds no audio, no text and no file names.
+These counts are on by default; the consent rule above is for VoiceStudio's own analytics. To turn the counts off, set `DO_NOT_TRACK=1` (or `PUBLIK_TELEMETRY=0`) in the environment. The sign-in stays.
 Details: https://publikhq.com/skills/telemetry.md
 
 <details>
